@@ -4,6 +4,7 @@ import "C"
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	bes "github.com/iegomez/mosquitto-go-auth/backends"
 	"github.com/iegomez/mosquitto-go-auth/cache"
 	"github.com/iegomez/mosquitto-go-auth/hashing"
+	"github.com/iegomez/mosquitto-go-auth/observability"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -127,6 +129,35 @@ func AuthPluginInit(keys []*C.char, values []*C.char, authOptsNum int, version *
 
 	if authPlugin.useCache {
 		setCache(authOpts)
+	}
+
+	// Initialize observability
+	initObservability(authOpts)
+}
+
+func initObservability(authOpts map[string]string) {
+	// Check if observability is enabled
+	if obs, ok := authOpts["observability_enabled"]; ok && strings.Replace(obs, " ", "", -1) == "true" {
+		metricsPort := 9090 // Default metrics port
+		if port, ok := authOpts["metrics_port"]; ok {
+			if p, err := strconv.Atoi(port); err == nil {
+				metricsPort = p
+			}
+		}
+
+		// Initialize observability
+		if err := observability.Initialize(context.Background(), "mosquitto-go-auth", metricsPort); err != nil {
+			log.Errorf("Failed to initialize observability: %v", err)
+		} else {
+			log.Infof("Observability initialized with metrics on port %d", metricsPort)
+		}
+
+		// Configure structured logging
+		if logLevel, ok := authOpts["log_level"]; ok {
+			if err := observability.InitializeLogging(logLevel, authPlugin.logDest, authPlugin.logFile); err != nil {
+				log.Errorf("Failed to initialize structured logging: %v", err)
+			}
+		}
 	}
 }
 
@@ -313,27 +344,68 @@ func authUnpwdCheck(username, password, clientid string) (bool, error) {
 	var granted bool
 	var err error
 
+	// Start timing
+	timer := observability.NewTimer()
+
+	// Create context with values for structured logging
+	ctx := observability.ContextWithValues(authPlugin.ctx, username, clientid, "auth")
+	ctx = observability.ContextWithOperation(ctx, "auth_unpwd_check")
+
+	// Record authentication attempt
+	observability.RecordAuthAttempt(ctx, "all")
+
+	// Create structured logger
+	logger := observability.NewLogEntry(ctx)
+
 	username = setUsername(username, clientid)
 
 	if authPlugin.useCache {
-		log.Debugf("checking auth cache for %s", username)
-		cached, granted = authPlugin.cache.CheckAuthRecord(authPlugin.ctx, username, password)
+		logger.Debug("checking auth cache")
+		cached, granted = authPlugin.cache.CheckAuthRecord(ctx, username, password)
 		if cached {
-			log.Debugf("found in cache: %s", username)
+			observability.RecordCacheHit(ctx, "auth")
+			logger.Debug("found in cache")
+
+			// Record metrics
+			latency := timer.ElapsedMs()
+			if granted {
+				observability.RecordAuthSuccess(ctx, "cache", latency)
+			} else {
+				observability.RecordAuthFailure(ctx, "cache", "invalid_credentials", latency)
+			}
 			return granted, nil
+		} else {
+			observability.RecordCacheMiss(ctx, "auth")
 		}
 	}
 
+	// Measure backend call
+	backendStart := time.Now()
 	authenticated, err = authPlugin.backends.AuthUnpwdCheck(username, password, clientid)
+	backendLatency := float64(time.Since(backendStart).Nanoseconds()) / 1e6
+
+	// Record backend metrics
+	observability.RecordBackendCall(ctx, "all", "auth_check", backendLatency, err)
+
+	if err != nil {
+		logger.WithError(err).Error("authentication backend error")
+		observability.RecordAuthFailure(ctx, "all", "backend_error", timer.ElapsedMs())
+	} else {
+		if authenticated {
+			observability.RecordAuthSuccess(ctx, "all", timer.ElapsedMs())
+		} else {
+			observability.RecordAuthFailure(ctx, "all", "invalid_credentials", timer.ElapsedMs())
+		}
+	}
 
 	if authPlugin.useCache && err == nil {
 		authGranted := "false"
 		if authenticated {
 			authGranted = "true"
 		}
-		log.Debugf("setting auth cache for %s", username)
-		if setAuthErr := authPlugin.cache.SetAuthRecord(authPlugin.ctx, username, password, authGranted); setAuthErr != nil {
-			log.Errorf("set auth cache: %s", setAuthErr)
+		logger.Debug("setting auth cache")
+		if setAuthErr := authPlugin.cache.SetAuthRecord(ctx, username, password, authGranted); setAuthErr != nil {
+			logger.WithError(setAuthErr).Error("set auth cache")
 			return false, setAuthErr
 		}
 	}
@@ -370,32 +442,76 @@ func authAclCheck(clientid, username, topic string, acc int) (bool, error) {
 	var granted bool
 	var err error
 
+	// Start timing
+	timer := observability.NewTimer()
+
+	// Create context with values for structured logging
+	ctx := observability.ContextWithValues(authPlugin.ctx, username, clientid, "acl")
+	ctx = observability.ContextWithOperation(ctx, "acl_check")
+	ctx = observability.ContextWithTopic(ctx, topic)
+	accessType := observability.GetAccessTypeString(acc)
+	ctx = observability.ContextWithAccessType(ctx, accessType)
+
+	// Record ACL check attempt
+	observability.RecordACLCheck(ctx, "all", topic, accessType)
+
+	// Create structured logger
+	logger := observability.NewLogEntry(ctx)
+
 	username = setUsername(username, clientid)
 
 	if authPlugin.useCache {
-		log.Debugf("checking acl cache for %s", username)
-		cached, granted = authPlugin.cache.CheckACLRecord(authPlugin.ctx, username, topic, clientid, acc)
+		logger.Debug("checking acl cache")
+		cached, granted = authPlugin.cache.CheckACLRecord(ctx, username, topic, clientid, acc)
 		if cached {
-			log.Debugf("found in cache: %s", username)
+			observability.RecordCacheHit(ctx, "acl")
+			logger.Debug("found in cache")
+
+			// Record metrics
+			latency := timer.ElapsedMs()
+			if granted {
+				observability.RecordACLGranted(ctx, "cache", topic, accessType, latency)
+			} else {
+				observability.RecordACLDenied(ctx, "cache", topic, accessType, latency)
+			}
 			return granted, nil
+		} else {
+			observability.RecordCacheMiss(ctx, "acl")
 		}
 	}
 
+	// Measure backend call
+	backendStart := time.Now()
 	aclCheck, err = authPlugin.backends.AuthAclCheck(clientid, username, topic, acc)
+	backendLatency := float64(time.Since(backendStart).Nanoseconds()) / 1e6
+
+	// Record backend metrics
+	observability.RecordBackendCall(ctx, "all", "acl_check", backendLatency, err)
+
+	if err != nil {
+		logger.WithError(err).Error("ACL backend error")
+		observability.RecordACLDenied(ctx, "all", topic, accessType, timer.ElapsedMs())
+	} else {
+		if aclCheck {
+			observability.RecordACLGranted(ctx, "all", topic, accessType, timer.ElapsedMs())
+		} else {
+			observability.RecordACLDenied(ctx, "all", topic, accessType, timer.ElapsedMs())
+		}
+	}
 
 	if authPlugin.useCache && err == nil {
 		authGranted := "false"
 		if aclCheck {
 			authGranted = "true"
 		}
-		log.Debugf("setting acl cache (granted = %s) for %s", authGranted, username)
-		if setACLErr := authPlugin.cache.SetACLRecord(authPlugin.ctx, username, topic, clientid, acc, authGranted); setACLErr != nil {
-			log.Errorf("set acl cache: %s", setACLErr)
+		logger.WithField("granted", authGranted).Debug("setting acl cache")
+		if setACLErr := authPlugin.cache.SetACLRecord(ctx, username, topic, clientid, acc, authGranted); setACLErr != nil {
+			logger.WithError(setACLErr).Error("set acl cache")
 			return false, setACLErr
 		}
 	}
 
-	log.Debugf("Acl is %t for user %s", aclCheck, username)
+	logger.WithField("granted", aclCheck).Debug("ACL check complete")
 	return aclCheck, err
 }
 
