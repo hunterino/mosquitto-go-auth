@@ -1,6 +1,7 @@
 package backends
 
 import (
+	"context"
 	"encoding/json"
 	"io/ioutil"
 	"net/http"
@@ -11,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang-jwt/jwt"
+	"github.com/golang-jwt/jwt/v5"
 	. "github.com/iegomez/mosquitto-go-auth/backends/constants"
 	"github.com/iegomez/mosquitto-go-auth/hashing"
 	log "github.com/sirupsen/logrus"
@@ -282,8 +283,11 @@ func TestLocalPostgresJWT(t *testing.T) {
 			So(err, ShouldBeNil)
 
 			//Empty db
-			db.DB.MustExec("delete from test_user where 1 = 1")
-			db.DB.MustExec("delete from test_acl where 1 = 1")
+			ctx := context.Background()
+			_, err = db.pool.Exec(ctx, "delete from test_user where 1 = 1")
+			So(err, ShouldBeNil)
+			_, err = db.pool.Exec(ctx, "delete from test_acl where 1 = 1")
+			So(err, ShouldBeNil)
 
 			//Now test everything.
 
@@ -291,7 +295,7 @@ func TestLocalPostgresJWT(t *testing.T) {
 
 			userID := 0
 
-			err = db.DB.Get(&userID, insertQuery, username, userPassHash, true)
+			err = db.pool.QueryRow(ctx, insertQuery, username, userPassHash, true).Scan(&userID)
 
 			So(err, ShouldBeNil)
 			So(userID, ShouldBeGreaterThan, 0)
@@ -340,7 +344,7 @@ func TestLocalPostgresJWT(t *testing.T) {
 
 			aclID := 0
 			aclQuery := "INSERT INTO test_acl(test_user_id, topic, rw) values($1, $2, $3) returning id"
-			err = db.DB.Get(&aclID, aclQuery, userID, strictACL, MOSQ_ACL_READ)
+			err = db.pool.QueryRow(ctx, aclQuery, userID, strictACL, MOSQ_ACL_READ).Scan(&aclID)
 			So(err, ShouldBeNil)
 
 			Convey("Given only strict acl in db, an exact match should work and and inexact one not", func() {
@@ -381,7 +385,7 @@ func TestLocalPostgresJWT(t *testing.T) {
 
 			//Now insert single level topic to check against.
 
-			err = db.DB.Get(&aclID, aclQuery, userID, singleLevelACL, MOSQ_ACL_READ)
+			err = db.pool.QueryRow(ctx, aclQuery, userID, singleLevelACL, MOSQ_ACL_READ).Scan(&aclID)
 			So(err, ShouldBeNil)
 
 			Convey("Given a topic not strictly present that matches a db single level wildcard, acl check should pass", func() {
@@ -392,7 +396,7 @@ func TestLocalPostgresJWT(t *testing.T) {
 
 			//Now insert hierarchy wildcard to check against.
 
-			err = db.DB.Get(&aclID, aclQuery, userID, hierarchyACL, MOSQ_ACL_READ)
+			err = db.pool.QueryRow(ctx, aclQuery, userID, hierarchyACL, MOSQ_ACL_READ).Scan(&aclID)
 			So(err, ShouldBeNil)
 
 			Convey("Given a topic not strictly present that matches a hierarchy wildcard, acl check should pass", func() {
@@ -428,8 +432,10 @@ func TestLocalPostgresJWT(t *testing.T) {
 			})
 
 			//Empty db
-			db.DB.MustExec("delete from test_user where 1 = 1")
-			db.DB.MustExec("delete from test_acl where 1 = 1")
+			_, err = db.pool.Exec(ctx, "delete from test_user where 1 = 1")
+			So(err, ShouldBeNil)
+			_, err = db.pool.Exec(ctx, "delete from test_acl where 1 = 1")
+			So(err, ShouldBeNil)
 
 			jwt.Halt()
 		})
@@ -482,8 +488,10 @@ func TestLocalMysqlJWT(t *testing.T) {
 			So(err, ShouldBeNil)
 
 			//Empty db
-			db.DB.MustExec("delete from test_user where 1 = 1")
-			db.DB.MustExec("delete from test_acl where 1 = 1")
+			_, err = db.DB.Exec("delete from test_user where 1 = 1")
+			So(err, ShouldBeNil)
+			_, err = db.DB.Exec("delete from test_acl where 1 = 1")
+			So(err, ShouldBeNil)
 
 			//Now test everything.
 
@@ -495,7 +503,6 @@ func TestLocalMysqlJWT(t *testing.T) {
 			So(err, ShouldBeNil)
 
 			userID, err = res.LastInsertId()
-
 			So(err, ShouldBeNil)
 			So(userID, ShouldBeGreaterThan, 0)
 
@@ -632,8 +639,10 @@ func TestLocalMysqlJWT(t *testing.T) {
 			})
 
 			//Empty db
-			db.DB.MustExec("delete from test_user where 1 = 1")
-			db.DB.MustExec("delete from test_acl where 1 = 1")
+			_, err = db.DB.Exec("delete from test_user where 1 = 1")
+			So(err, ShouldBeNil)
+			_, err = db.DB.Exec("delete from test_acl where 1 = 1")
+			So(err, ShouldBeNil)
 
 			jwt.Halt()
 

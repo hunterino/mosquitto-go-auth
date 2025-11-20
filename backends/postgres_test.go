@@ -1,6 +1,7 @@
 package backends
 
 import (
+	"context"
 	"testing"
 
 	. "github.com/iegomez/mosquitto-go-auth/backends/constants"
@@ -35,8 +36,11 @@ func TestPostgres(t *testing.T) {
 		So(err, ShouldBeNil)
 
 		//Empty db
-		postgres.DB.MustExec("delete from test_user where 1 = 1")
-		postgres.DB.MustExec("delete from test_acl where 1 = 1")
+		ctx := context.Background()
+		_, err = postgres.pool.Exec(ctx, "delete from test_user where 1 = 1")
+		So(err, ShouldBeNil)
+		_, err = postgres.pool.Exec(ctx, "delete from test_acl where 1 = 1")
+		So(err, ShouldBeNil)
 
 		//Insert a user to test auth
 		username := "test"
@@ -49,7 +53,7 @@ func TestPostgres(t *testing.T) {
 
 		userID := 0
 
-		err = postgres.DB.Get(&userID, insertQuery, username, userPassHash, true)
+		err = postgres.pool.QueryRow(ctx, insertQuery, username, userPassHash, true).Scan(&userID)
 
 		So(err, ShouldBeNil)
 		So(userID, ShouldBeGreaterThan, 0)
@@ -103,7 +107,7 @@ func TestPostgres(t *testing.T) {
 
 		aclID := 0
 		aclQuery := "INSERT INTO test_acl(test_user_id, topic, rw) values($1, $2, $3) returning id"
-		err = postgres.DB.Get(&aclID, aclQuery, userID, strictAcl, MOSQ_ACL_READ)
+		err = postgres.pool.QueryRow(ctx, aclQuery, userID, strictAcl, MOSQ_ACL_READ).Scan(&aclID)
 		So(err, ShouldBeNil)
 
 		Convey("Given only strict acl in db, an exact match should work and and inexact one not", func() {
@@ -144,7 +148,7 @@ func TestPostgres(t *testing.T) {
 
 		//Now check against patterns.
 
-		err = postgres.DB.Get(&aclID, aclQuery, userID, userPattern, MOSQ_ACL_READ)
+		err = postgres.pool.QueryRow(ctx, aclQuery, userID, userPattern, MOSQ_ACL_READ).Scan(&aclID)
 		So(err, ShouldBeNil)
 
 		Convey("Given a topic that mentions username, acl check should pass", func() {
@@ -153,7 +157,7 @@ func TestPostgres(t *testing.T) {
 			So(tt1, ShouldBeTrue)
 		})
 
-		err = postgres.DB.Get(&aclID, aclQuery, userID, clientPattern, MOSQ_ACL_READ)
+		err = postgres.pool.QueryRow(ctx, aclQuery, userID, clientPattern, MOSQ_ACL_READ).Scan(&aclID)
 		So(err, ShouldBeNil)
 
 		Convey("Given a topic that mentions clientid, acl check should pass", func() {
@@ -164,7 +168,7 @@ func TestPostgres(t *testing.T) {
 
 		//Now insert single level topic to check against.
 
-		err = postgres.DB.Get(&aclID, aclQuery, userID, singleLevelAcl, MOSQ_ACL_READ)
+		err = postgres.pool.QueryRow(ctx, aclQuery, userID, singleLevelAcl, MOSQ_ACL_READ).Scan(&aclID)
 		So(err, ShouldBeNil)
 
 		Convey("Given a topic not strictly present that matches a db single level wildcard, acl check should pass", func() {
@@ -175,7 +179,7 @@ func TestPostgres(t *testing.T) {
 
 		//Now insert hierarchy wildcard to check against.
 
-		err = postgres.DB.Get(&aclID, aclQuery, userID, hierarchyAcl, MOSQ_ACL_READ)
+		err = postgres.pool.QueryRow(ctx, aclQuery, userID, hierarchyAcl, MOSQ_ACL_READ).Scan(&aclID)
 		So(err, ShouldBeNil)
 
 		Convey("Given a topic not strictly present that matches a hierarchy wildcard, acl check should pass", func() {
@@ -192,8 +196,10 @@ func TestPostgres(t *testing.T) {
 		})
 
 		//Empty db
-		postgres.DB.MustExec("delete from test_user where 1 = 1")
-		postgres.DB.MustExec("delete from test_acl where 1 = 1")
+		_, err = postgres.pool.Exec(ctx, "delete from test_user where 1 = 1")
+		So(err, ShouldBeNil)
+		_, err = postgres.pool.Exec(ctx, "delete from test_acl where 1 = 1")
+		So(err, ShouldBeNil)
 
 		postgres.Halt()
 
@@ -218,7 +224,7 @@ func TestPostgresTls(t *testing.T) {
 		postgres, err := NewPostgres(authOpts, log.DebugLevel, hashing.NewHasher(authOpts, "postgres"))
 		So(err, ShouldBeError)
 		So(err.Error(), ShouldContainSubstring, "pg_hba.conf rejects connection")
-		So(postgres.DB, ShouldBeNil)
+		So(postgres.pool, ShouldBeNil)
 	})
 
 	authOpts["pg_sslmode"] = "verify-full"
@@ -228,7 +234,8 @@ func TestPostgresTls(t *testing.T) {
 		postgres, err := NewPostgres(authOpts, log.DebugLevel, hashing.NewHasher(authOpts, "postgres"))
 		So(err, ShouldBeNil)
 
-		rows, err := postgres.DB.Query("SELECT cipher FROM pg_stat_activity JOIN pg_stat_ssl USING(pid);")
+		ctx := context.Background()
+		rows, err := postgres.pool.Query(ctx, "SELECT cipher FROM pg_stat_activity JOIN pg_stat_ssl USING(pid);")
 		So(err, ShouldBeNil)
 		So(rows.Next(), ShouldBeTrue)
 
@@ -258,7 +265,7 @@ func TestPostgresMutualTls(t *testing.T) {
 		postgres, err := NewPostgres(authOpts, log.DebugLevel, hashing.NewHasher(authOpts, "postgres"))
 		So(err, ShouldBeError)
 		So(err.Error(), ShouldEqual, "PG backend error: couldn't open db: couldn't ping database postgres: pq: connection requires a valid client certificate")
-		So(postgres.DB, ShouldBeNil)
+		So(postgres.pool, ShouldBeNil)
 	})
 
 	authOpts["pg_sslcert"] = "/test-files/certificates/grpc/client.pem"
@@ -268,7 +275,7 @@ func TestPostgresMutualTls(t *testing.T) {
 		postgres, err := NewPostgres(authOpts, log.DebugLevel, hashing.NewHasher(authOpts, "postgres"))
 		So(err, ShouldBeError)
 		So(err.Error(), ShouldEqual, "PG backend error: couldn't open db: couldn't ping database postgres: pq: connection requires a valid client certificate")
-		So(postgres.DB, ShouldBeNil)
+		So(postgres.pool, ShouldBeNil)
 	})
 
 	authOpts["pg_sslcert"] = "/test-files/certificates/db/client.pem"
@@ -278,7 +285,8 @@ func TestPostgresMutualTls(t *testing.T) {
 		postgres, err := NewPostgres(authOpts, log.DebugLevel, hashing.NewHasher(authOpts, "postgres"))
 		So(err, ShouldBeNil)
 
-		rows, err := postgres.DB.Query("SELECT cipher FROM pg_stat_activity JOIN pg_stat_ssl USING(pid);")
+		ctx := context.Background()
+		rows, err := postgres.pool.Query(ctx, "SELECT cipher FROM pg_stat_activity JOIN pg_stat_ssl USING(pid);")
 		So(err, ShouldBeNil)
 		So(rows.Next(), ShouldBeTrue)
 

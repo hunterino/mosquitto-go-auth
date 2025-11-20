@@ -3,7 +3,7 @@ package backends
 import (
 	"fmt"
 
-	jwtGo "github.com/golang-jwt/jwt"
+	jwtGo "github.com/golang-jwt/jwt/v5"
 	"github.com/iegomez/mosquitto-go-auth/hashing"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
@@ -128,18 +128,29 @@ func (o *JWT) Halt() {
 func getJWTClaims(secret string, tokenStr string, skipExpiration bool) (*jwtGo.MapClaims, error) {
 
 	jwtToken, err := jwtGo.ParseWithClaims(tokenStr, &jwtGo.MapClaims{}, func(token *jwtGo.Token) (interface{}, error) {
+		// Explicit algorithm validation (v5 security improvement)
+		// Only allow HMAC signing methods
+		if _, ok := token.Method.(*jwtGo.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
 		return []byte(secret), nil
 	})
 
 	expirationError := false
 	if err != nil {
-		if !skipExpiration {
+		if errors.Is(err, jwtGo.ErrTokenExpired) {
+			if skipExpiration {
+				// Skip expiration validation - allow expired tokens
+				expirationError = true
+			} else {
+				// Don't skip expiration - return the error
+				log.Debugf("jwt parse error: %s", err)
+				return nil, err
+			}
+		} else {
+			// Not an expiration error - return it regardless of skipExpiration
 			log.Debugf("jwt parse error: %s", err)
 			return nil, err
-		}
-
-		if v, ok := err.(*jwtGo.ValidationError); ok && v.Errors == jwtGo.ValidationErrorExpired {
-			expirationError = true
 		}
 	}
 

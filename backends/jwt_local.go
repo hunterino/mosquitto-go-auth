@@ -1,10 +1,11 @@
 package backends
 
 import (
-	"database/sql"
+	"context"
 	"strings"
 
 	"github.com/iegomez/mosquitto-go-auth/hashing"
+	"github.com/jackc/pgx/v5"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 )
@@ -119,16 +120,10 @@ func (o *localJWTChecker) CheckAcl(token, topic, clientid string, acc int32) (bo
 }
 
 func (o *localJWTChecker) Halt() {
-	if o.postgres != (Postgres{}) && o.postgres.DB != nil {
-		err := o.postgres.DB.Close()
-		if err != nil {
-			log.Errorf("JWT cleanup error: %s", err)
-		}
+	if o.postgres != (Postgres{}) && o.postgres.pool != nil {
+		o.postgres.Halt()
 	} else if o.mysql != (Mysql{}) && o.mysql.DB != nil {
-		err := o.mysql.DB.Close()
-		if err != nil {
-			log.Errorf("JWT cleanup error: %s", err)
-		}
+		o.mysql.Halt()
 	}
 }
 
@@ -137,12 +132,16 @@ func (o *localJWTChecker) getLocalUser(username string) (bool, error) {
 		return false, nil
 	}
 
-	var count sql.NullInt64
+	ctx := context.Background()
+	var count int64
 	var err error
 	if o.db == mysqlDB {
 		err = o.mysql.DB.Get(&count, o.userQuery, username)
 	} else {
-		err = o.postgres.DB.Get(&count, o.userQuery, username)
+		err = o.postgres.pool.QueryRow(ctx, o.userQuery, username).Scan(&count)
+		if err == pgx.ErrNoRows {
+			return false, nil
+		}
 	}
 
 	if err != nil {
@@ -150,12 +149,7 @@ func (o *localJWTChecker) getLocalUser(username string) (bool, error) {
 		return false, err
 	}
 
-	if !count.Valid {
-		log.Debugf("local JWT get user error: user %s not found", username)
-		return false, nil
-	}
-
-	if count.Int64 > 0 {
+	if count > 0 {
 		return true, nil
 	}
 
