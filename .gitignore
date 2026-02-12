@@ -28,3 +28,5 @@ test-files/certificates/**/*.pem
 
 # todo
 TODO
+
+logs/
