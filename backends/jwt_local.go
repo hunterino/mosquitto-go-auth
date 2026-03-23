@@ -1,7 +1,6 @@
 package backends
 
 import (
-	"context"
 	"strings"
 
 	"github.com/iegomez/mosquitto-go-auth/hashing"
@@ -132,15 +131,26 @@ func (o *localJWTChecker) getLocalUser(username string) (bool, error) {
 		return false, nil
 	}
 
-	ctx := context.Background()
 	var count int64
 	var err error
 	if o.db == mysqlDB {
 		err = o.mysql.DB.Get(&count, o.userQuery, username)
 	} else {
-		err = o.postgres.pool.QueryRow(ctx, o.userQuery, username).Scan(&count)
-		if err == pgx.ErrNoRows {
-			return false, nil
+		for attempt := 0; attempt <= o.postgres.queryRetries; attempt++ {
+			ctx, cancel := o.postgres.queryContext()
+			err = o.postgres.pool.QueryRow(ctx, o.userQuery, username).Scan(&count)
+			cancel()
+
+			if err == nil {
+				break
+			}
+			if err == pgx.ErrNoRows {
+				return false, nil
+			}
+			if attempt < o.postgres.queryRetries && isConnectionError(err) {
+				log.Warnf("JWT local get user connection error (attempt %d/%d): %s", attempt+1, o.postgres.queryRetries+1, err)
+				continue
+			}
 		}
 	}
 

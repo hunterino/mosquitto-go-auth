@@ -37,6 +37,8 @@ type Postgres struct {
 	maxConnIdleTime   time.Duration
 	healthCheckPeriod time.Duration
 	connectTries      int
+	queryTimeout      time.Duration
+	queryRetries      int
 
 	// Prepared statements
 	usePreparedStmts     bool
@@ -64,8 +66,10 @@ func NewPostgres(authOpts map[string]string, logLevel log.Level, hasher hashing.
 		hasher:            hasher,
 		maxConnections:    25,
 		minConnections:    5,
-		maxConnIdleTime:   time.Duration(300) * time.Second,
-		healthCheckPeriod: time.Duration(60) * time.Second,
+		maxConnIdleTime:   time.Duration(30) * time.Second,
+		healthCheckPeriod: time.Duration(15) * time.Second,
+		queryTimeout:      time.Duration(5) * time.Second,
+		queryRetries:      1,
 	}
 
 	if host, ok := authOpts["pg_host"]; ok {
@@ -219,6 +223,22 @@ func NewPostgres(authOpts map[string]string, logLevel log.Level, hasher hashing.
 		}
 	}
 
+	if queryTimeout, ok := authOpts["pg_query_timeout"]; ok {
+		if val, err := strconv.ParseInt(queryTimeout, 10, 64); err == nil {
+			postgres.queryTimeout = time.Duration(val) * time.Second
+		} else {
+			log.Warnf("invalid pg_query_timeout value: %s", err)
+		}
+	}
+
+	if queryRetries, ok := authOpts["pg_query_retries"]; ok {
+		if val, err := strconv.Atoi(queryRetries); err == nil {
+			postgres.queryRetries = val
+		} else {
+			log.Warnf("invalid pg_query_retries value: %s", err)
+		}
+	}
+
 	// Parse prepared statements configuration (enabled by default for performance)
 	postgres.usePreparedStmts = true
 	if prepStmts, ok := authOpts["pg_use_prepared_statements"]; ok {
@@ -249,6 +269,22 @@ func NewPostgres(authOpts map[string]string, logLevel log.Level, hasher hashing.
 
 	if postgres.maxLifeTime > 0 {
 		poolConfig.MaxConnLifetime = time.Duration(postgres.maxLifeTime) * time.Second
+	} else {
+		// Default to 15 minutes to ensure connections are recycled
+		poolConfig.MaxConnLifetime = 15 * time.Minute
+	}
+
+	// Validate connections before handing them out from the pool.
+	// This catches dead connections (e.g., after OS sleep/wake) before
+	// they cause query failures.
+	poolConfig.BeforeAcquire = func(ctx context.Context, conn *pgx.Conn) bool {
+		pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		if err := conn.Ping(pingCtx); err != nil {
+			log.Warnf("PG backend: discarding unhealthy connection: %s", err)
+			return false
+		}
+		return true
 	}
 
 	// Create the connection pool with retries
@@ -299,6 +335,31 @@ func NewPostgres(authOpts map[string]string, logLevel log.Level, hasher hashing.
 
 }
 
+// queryContext returns a context with the configured query timeout.
+func (o *Postgres) queryContext() (context.Context, context.CancelFunc) {
+	if o.queryTimeout > 0 {
+		return context.WithTimeout(context.Background(), o.queryTimeout)
+	}
+	return context.Background(), func() {}
+}
+
+// isConnectionError returns true if the error indicates a broken connection
+// that would benefit from a retry with a fresh connection.
+func isConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "conn closed") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "unexpected EOF") ||
+		strings.Contains(msg, "i/o timeout") ||
+		strings.Contains(msg, "context deadline exceeded") ||
+		strings.Contains(msg, "failed to connect")
+}
+
 // prepareStatements creates prepared statements for all queries
 func (o *Postgres) prepareStatements(ctx context.Context) error {
 	conn, err := o.pool.Acquire(ctx)
@@ -339,22 +400,29 @@ func (o *Postgres) prepareStatements(ctx context.Context) error {
 
 //GetUser checks that the username exists and the given password hashes to the same password.
 func (o Postgres) GetUser(username, password, clientid string) (bool, error) {
-	ctx := context.Background()
-
 	var pwHash string
 	var err error
 
-	// Use prepared statement if available, otherwise use regular query
-	if o.preparedStmtsReady {
-		err = o.pool.QueryRow(ctx, o.userStmtName, username).Scan(&pwHash)
-	} else {
-		err = o.pool.QueryRow(ctx, o.UserQuery, username).Scan(&pwHash)
-	}
+	for attempt := 0; attempt <= o.queryRetries; attempt++ {
+		ctx, cancel := o.queryContext()
 
-	if err != nil {
+		if o.preparedStmtsReady {
+			err = o.pool.QueryRow(ctx, o.userStmtName, username).Scan(&pwHash)
+		} else {
+			err = o.pool.QueryRow(ctx, o.UserQuery, username).Scan(&pwHash)
+		}
+		cancel()
+
+		if err == nil {
+			break
+		}
 		if err == pgx.ErrNoRows {
-			// avoid leaking the fact that user exists or not through error.
 			return false, nil
+		}
+		if attempt < o.queryRetries && isConnectionError(err) {
+			log.Warnf("PG get user connection error (attempt %d/%d): %s", attempt+1, o.queryRetries+1, err)
+			time.Sleep(100 * time.Millisecond)
+			continue
 		}
 
 		log.Debugf("PG get user error: %s", err)
@@ -371,33 +439,37 @@ func (o Postgres) GetUser(username, password, clientid string) (bool, error) {
 	}
 
 	return false, nil
-
 }
 
 //GetSuperuser checks that the username meets the superuser query.
 func (o Postgres) GetSuperuser(username string) (bool, error) {
-
-	//If there's no superuser query, return false.
 	if o.SuperuserQuery == "" {
 		return false, nil
 	}
 
-	ctx := context.Background()
-
 	var count int64
 	var err error
 
-	// Use prepared statement if available, otherwise use regular query
-	if o.preparedStmtsReady {
-		err = o.pool.QueryRow(ctx, o.superuserStmtName, username).Scan(&count)
-	} else {
-		err = o.pool.QueryRow(ctx, o.SuperuserQuery, username).Scan(&count)
-	}
+	for attempt := 0; attempt <= o.queryRetries; attempt++ {
+		ctx, cancel := o.queryContext()
 
-	if err != nil {
+		if o.preparedStmtsReady {
+			err = o.pool.QueryRow(ctx, o.superuserStmtName, username).Scan(&count)
+		} else {
+			err = o.pool.QueryRow(ctx, o.SuperuserQuery, username).Scan(&count)
+		}
+		cancel()
+
+		if err == nil {
+			break
+		}
 		if err == pgx.ErrNoRows {
-			// avoid leaking the fact that user exists or not through error.
 			return false, nil
+		}
+		if attempt < o.queryRetries && isConnectionError(err) {
+			log.Warnf("PG get superuser connection error (attempt %d/%d): %s", attempt+1, o.queryRetries+1, err)
+			time.Sleep(100 * time.Millisecond)
+			continue
 		}
 
 		log.Debugf("PG get superuser error: %s", err)
@@ -409,47 +481,66 @@ func (o Postgres) GetSuperuser(username string) (bool, error) {
 	}
 
 	return false, nil
-
 }
 
 //CheckAcl gets all acls for the username and tries to match against topic, acc, and username/clientid if needed.
 func (o Postgres) CheckAcl(username, topic, clientid string, acc int32) (bool, error) {
-
-	//If there's no acl query, assume all privileges for all users.
 	if o.AclQuery == "" {
 		return true, nil
 	}
 
-	ctx := context.Background()
-
-	var rows pgx.Rows
+	var acls []string
 	var err error
 
-	// Use prepared statement if available, otherwise use regular query
-	if o.preparedStmtsReady {
-		rows, err = o.pool.Query(ctx, o.aclStmtName, username, acc)
-	} else {
-		rows, err = o.pool.Query(ctx, o.AclQuery, username, acc)
-	}
+	for attempt := 0; attempt <= o.queryRetries; attempt++ {
+		ctx, cancel := o.queryContext()
 
-	if err != nil {
-		log.Debugf("PG check acl error: %s", err)
-		return false, err
-	}
-	defer rows.Close()
+		var rows pgx.Rows
+		if o.preparedStmtsReady {
+			rows, err = o.pool.Query(ctx, o.aclStmtName, username, acc)
+		} else {
+			rows, err = o.pool.Query(ctx, o.AclQuery, username, acc)
+		}
 
-	var acls []string
-	for rows.Next() {
-		var acl string
-		if err := rows.Scan(&acl); err != nil {
-			log.Debugf("PG check acl scan error: %s", err)
+		if err != nil {
+			cancel()
+			if attempt < o.queryRetries && isConnectionError(err) {
+				log.Warnf("PG check acl connection error (attempt %d/%d): %s", attempt+1, o.queryRetries+1, err)
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			log.Debugf("PG check acl error: %s", err)
 			return false, err
 		}
-		acls = append(acls, acl)
-	}
 
-	if err := rows.Err(); err != nil {
-		log.Debugf("PG check acl rows error: %s", err)
+		acls = nil
+		var scanErr error
+		for rows.Next() {
+			var acl string
+			if scanErr = rows.Scan(&acl); scanErr != nil {
+				break
+			}
+			acls = append(acls, acl)
+		}
+		rows.Close()
+		cancel()
+
+		if scanErr != nil {
+			err = scanErr
+		} else {
+			err = rows.Err()
+		}
+
+		if err == nil {
+			break
+		}
+		if attempt < o.queryRetries && isConnectionError(err) {
+			log.Warnf("PG check acl connection error (attempt %d/%d): %s", attempt+1, o.queryRetries+1, err)
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
+		log.Debugf("PG check acl error: %s", err)
 		return false, err
 	}
 
@@ -462,7 +553,6 @@ func (o Postgres) CheckAcl(username, topic, clientid string, acc int32) (bool, e
 	}
 
 	return false, nil
-
 }
 
 //GetName returns the backend's name
